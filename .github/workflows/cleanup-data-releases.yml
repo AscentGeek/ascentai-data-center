@@ -1,0 +1,47 @@
+# data_api(response_format=download_url)가 올린 일자별 release(data-YYYYMMDD)를
+# RETENTION_DAYS일 지나면 release·태그 통째로 삭제한다.
+# - data-YYYYMMDD 패턴 외의 release(수동 업로드·기존 검증용 등)는 건드리지 않음
+# - 토큰: Actions 기본 github.token 사용 (PAT 불필요)
+# - RETENTION_DAYS는 1 이상 유지 (0이어도 오늘자는 남지만, 자정 직전 응답의
+#   다운로드 주소가 직후 삭제로 끊기는 경계를 피하려면 1일 이상)
+
+name: cleanup-data-releases
+
+on:
+  schedule:
+    - cron: "20 16 * * *"   # 매일 16:20 UTC = 01:20 KST
+  workflow_dispatch: {}      # 수동 실행용
+
+permissions:
+  contents: write            # release/태그 삭제 권한
+
+env:
+  RETENTION_DAYS: "2"        # 오늘 포함 최근 2일치(data-오늘, data-어제) 보존
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete data releases older than retention
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d "-${RETENTION_DAYS} days" +%Y%m%d)
+          echo "cutoff: data-${cutoff} 이전(<) 태그 삭제"
+          gh api "repos/${REPO}/releases" --paginate \
+            -q '.[] | [.id, .tag_name] | @tsv' |
+          while IFS=$'\t' read -r release_id tag; do
+            case "$tag" in
+              data-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+                day=${tag#data-}
+                if [ "$day" -lt "$cutoff" ]; then
+                  echo "delete: ${tag} (release_id=${release_id})"
+                  gh api -X DELETE "repos/${REPO}/releases/${release_id}"
+                  gh api -X DELETE "repos/${REPO}/git/refs/tags/${tag}" || true
+                fi
+                ;;
+            esac
+          done
+          echo "done"
