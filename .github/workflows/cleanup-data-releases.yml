@@ -1,9 +1,17 @@
+# ascentai-data-center 저장소의 .github/workflows/cleanup-data-releases.yml 로 교체할 파일
+#
 # data_api(response_format=download_url)가 올린 일자별 release(data-YYYYMMDD)를
 # RETENTION_DAYS일 지나면 release·태그 통째로 삭제한다.
 # - data-YYYYMMDD 패턴 외의 release(수동 업로드·기존 검증용 등)는 건드리지 않음
 # - 토큰: Actions 기본 github.token 사용 (PAT 불필요)
-# - RETENTION_DAYS는 1 이상 유지 (0이어도 오늘자는 남지만, 자정 직전 응답의
-#   다운로드 주소가 직후 삭제로 끊기는 경계를 피하려면 1일 이상)
+# - RETENTION_DAYS는 1 이상 유지 (자정 직전 응답의 다운로드 주소가 직후 삭제로 끊기는 경계 방지)
+#
+# 2026-11 개정 (2026-10-15부터 매일 실패):
+# - 목록 조회를 REST `releases`(asset 목록까지 통째로 내려와 페이지당 20MB 이상) →
+#   `gh release list --json`(태그명만, GraphQL)로 교체
+# - release 하나 삭제에 실패해도 나머지는 계속 지우고, 실패한 태그와 GitHub 에러를
+#   로그에 남긴 뒤 마지막에 실패 처리 (이전에는 첫 실패에서 바로 종료 → 그 뒤 전부 쌓임)
+# - release와 태그를 `gh release delete --cleanup-tag` 한 번으로 삭제
 
 name: cleanup-data-releases
 
@@ -25,23 +33,31 @@ jobs:
       - name: Delete data releases older than retention
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          cutoff=$(date -u -d "-${RETENTION_DAYS} days" +%Y%m%d)
+          set -uo pipefail
+          cutoff=$(date -u -d "${RETENTION_DAYS} days ago" +%Y%m%d)
           echo "cutoff: data-${cutoff} 이전(<) 태그 삭제"
-          gh api "repos/${REPO}/releases" --paginate \
-            -q '.[] | [.id, .tag_name] | @tsv' |
-          while IFS=$'\t' read -r release_id tag; do
+
+          tags=$(gh release list --limit 1000 --json tagName -q '.[].tagName') || {
+            echo "::error::release 목록 조회 실패"; exit 1; }
+
+          deleted=0; failed=0
+          for tag in $tags; do
             case "$tag" in
-              data-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
-                day=${tag#data-}
-                if [ "$day" -lt "$cutoff" ]; then
-                  echo "delete: ${tag} (release_id=${release_id})"
-                  gh api -X DELETE "repos/${REPO}/releases/${release_id}"
-                  gh api -X DELETE "repos/${REPO}/git/refs/tags/${tag}" || true
-                fi
-                ;;
+              data-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+              *) continue ;;
             esac
+            day=${tag#data-}
+            [ "$day" -lt "$cutoff" ] || continue
+            echo "delete: ${tag}"
+            if gh release delete "$tag" --yes --cleanup-tag; then
+              deleted=$((deleted + 1))
+            else
+              echo "::error::${tag} 삭제 실패"
+              failed=$((failed + 1))
+            fi
           done
-          echo "done"
+
+          echo "done: deleted=${deleted}, failed=${failed}"
+          [ "$failed" -eq 0 ]
