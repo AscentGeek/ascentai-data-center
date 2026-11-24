@@ -13,8 +13,13 @@
 #   (341개는 502 뒤 서버에서 삭제 완료, 390개 이상은 남음) → data_api가 release당 300개로 나눔
 # - 삭제는 release 통째 삭제만 사용. 502가 나도 잠시 뒤 실제로 사라졌으면 성공으로 처리,
 #   남아 있으면 실패로 기록하고 다음 날 다시 시도. 하나가 실패해도 나머지는 계속 처리
-# - 1.0.18 이하에서 쌓인 큰 release(390~1000개)는 통째 삭제가 안 되므로, 수동 실행 때
-#   legacy_asset_delete=true 로 한 번 돌려 asset을 하나씩 지운 뒤 삭제 (정기 실행은 사용 안 함)
+#
+# 2026-11-24 개정 (11-19부터 다시 간헐 실패):
+# - 300개로 나눠도 통째 삭제가 502로 실패하는 release가 생김 (data-20261116-001~003,
+#   20261118-003/006/008, 20261120-001(299개)은 이틀 연속 실패). 서버가 뒤에서 마저 지우지도 않음
+# - 기존엔 asset 개별 삭제가 수동 실행 옵션(legacy_asset_delete)에만 있어서 정기 실행은 실패만 반복함
+# - 이제 통째 삭제가 실패하면 정기 실행에서도 바로 asset을 하나씩 지운 뒤 빈 release를 삭제
+#   (release당 최대 300개라 1개당 5~7분 정도). 수동 실행 옵션은 필요 없어져 제거
 
 name: cleanup-data-releases
 
@@ -22,11 +27,6 @@ on:
   schedule:
     - cron: "20 16 * * *"   # 매일 16:20 UTC = 01:20 KST
   workflow_dispatch:         # 수동 실행용
-    inputs:
-      legacy_asset_delete:
-        description: "통째 삭제가 실패한 release는 asset을 하나씩 지운 뒤 삭제 (1.0.18 이하 큰 release 정리용, 오래 걸림)"
-        type: boolean
-        default: false
 
 permissions:
   contents: write            # release/태그/asset 삭제 권한
@@ -47,12 +47,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          LEGACY_ASSET_DELETE: ${{ inputs.legacy_asset_delete && 'true' || 'false' }}
         run: |
           set -uo pipefail
           cutoff=$(date -u -d "${RETENTION_DAYS} days ago" +%Y%m%d)
           [[ "$cutoff" =~ ^[0-9]{8}$ ]] || { echo "::error::cutoff 날짜 계산 실패: '${cutoff}'"; exit 1; }
-          echo "cutoff: data-${cutoff} 이전(<) 태그 삭제 (legacy_asset_delete=${LEGACY_ASSET_DELETE})"
+          echo "cutoff: data-${cutoff} 이전(<) 태그 삭제"
 
           release_exists() { gh release view "$1" --json tagName >/dev/null 2>&1; }
 
@@ -102,7 +101,9 @@ jobs:
             if delete_whole "$tag"; then
               deleted=$((deleted + 1)); continue
             fi
-            if [ "$LEGACY_ASSET_DELETE" = "true" ] && delete_assets_one_by_one "$tag" && delete_whole "$tag"; then
+            # 통째 삭제 실패 → asset을 하나씩 지워 비운 뒤 다시 통째 삭제
+            echo "  통째 삭제 실패 → asset 개별 삭제로 전환"
+            if delete_assets_one_by_one "$tag" && delete_whole "$tag"; then
               deleted=$((deleted + 1)); continue
             fi
             echo "::error::${tag} 삭제 실패 (다음 실행에서 재시도)"
